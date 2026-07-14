@@ -19,6 +19,7 @@ run inside Claude's sandbox -- run it on your own machine:
 
 import asyncio
 import glob
+import os
 import time
 from collections import defaultdict
 
@@ -31,7 +32,13 @@ from pipeline import run_pipeline
 from tick_replay import find_entry_tick, find_settlement_price, iter_bar_ticks
 from strategy import StrategyConfig
 import checkpoint as ckpt
-from email_notifier import send_email_with_attachments, send_final_results_email, send_summary_email, should_notify
+from email_notifier import (
+    load_smtp_env_from_app_password,
+    send_email_with_attachments,
+    send_final_results_email,
+    send_summary_email,
+    should_notify,
+)
 
 
 TICK_PACE_DELAY = 0.3  # seconds between per-bar tick pulls, conservative default
@@ -397,6 +404,13 @@ def build_results_tables(all_results: dict):
 
 
 async def main():
+    load_smtp_env_from_app_password()
+
+    if is_configured():
+        print("SMTP email notifications are enabled.")
+    else:
+        print("SMTP email notifications are disabled or incomplete; backtest will still run.")
+
     client = DerivClient()
     await client.connect()
     auth = await client.authorize()

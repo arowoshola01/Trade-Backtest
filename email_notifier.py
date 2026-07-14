@@ -8,9 +8,37 @@ from email.message import EmailMessage
 def is_configured() -> bool:
     return bool(
         os.getenv("BACKTEST_SMTP_HOST")
+        and os.getenv("BACKTEST_SMTP_PORT")
+        and os.getenv("BACKTEST_SMTP_USERNAME")
+        and os.getenv("BACKTEST_SMTP_PASSWORD")
         and os.getenv("BACKTEST_SMTP_FROM")
         and os.getenv("BACKTEST_SMTP_TO")
     )
+
+
+def load_smtp_env_from_app_password(app_password_path: str = "app password.md") -> None:
+    if os.getenv("BACKTEST_SMTP_PASSWORD"):
+        return
+
+    if not os.path.isfile(app_password_path):
+        return
+
+    with open(app_password_path, "r", encoding="utf-8") as f:
+        password = f.readline().strip()
+
+    if not password:
+        return
+
+    os.environ.setdefault("BACKTEST_SMTP_PASSWORD", password)
+    os.environ.setdefault("BACKTEST_SMTP_HOST", "smtp.gmail.com")
+    os.environ.setdefault("BACKTEST_SMTP_PORT", "587")
+
+    if os.getenv("BACKTEST_SMTP_FROM") and not os.getenv("BACKTEST_SMTP_USERNAME"):
+        os.environ.setdefault("BACKTEST_SMTP_USERNAME", os.getenv("BACKTEST_SMTP_FROM"))
+    if os.getenv("BACKTEST_SMTP_USERNAME") and not os.getenv("BACKTEST_SMTP_FROM"):
+        os.environ.setdefault("BACKTEST_SMTP_FROM", os.getenv("BACKTEST_SMTP_USERNAME"))
+    if os.getenv("BACKTEST_SMTP_FROM") and not os.getenv("BACKTEST_SMTP_TO"):
+        os.environ.setdefault("BACKTEST_SMTP_TO", os.getenv("BACKTEST_SMTP_FROM"))
 
 
 def should_notify(progress_count: int, notify_every: int = 50) -> bool:
