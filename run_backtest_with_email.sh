@@ -10,8 +10,17 @@ export BACKTEST_SMTP_FROM="arowoshola01@gmail.com"
 export BACKTEST_SMTP_TO="arowoshola01@gmail.com"
 
 echo "Gmail SMTP is configured for arowoshola01@gmail.com."
-echo "Enter your Gmail app password (not your normal password):"
-read -s BACKTEST_SMTP_PASSWORD
+if [ -f "app password.md" ]; then
+  BACKTEST_SMTP_PASSWORD=$(sed -n '1p' "app password.md" | tr -d '\r\n')
+  if [ -z "$BACKTEST_SMTP_PASSWORD" ]; then
+    echo "app password.md is empty. Please paste your app password on the first line."
+    exit 1
+  fi
+else
+  echo "Enter your Gmail app password (not your normal password):"
+  read -s BACKTEST_SMTP_PASSWORD
+  echo
+fi
 export BACKTEST_SMTP_PASSWORD
 
 echo
