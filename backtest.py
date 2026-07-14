@@ -228,7 +228,7 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
         trades = state["trades"]
 
         completed_trade_epochs = {int(t["bar_epoch"]) for t in trades}
-        legacy_retryable_epochs = {int(e) for e in processed_epoch_set if int(e) not in completed_trade_epochs}
+        legacy_retryable_epochs = {int(e) for e in processed_epoch_set if int(e) not in completed_trade_epochs and int(e) not in dropped_bar_epochs}
         retryable_epochs = skipped_bar_epochs | legacy_retryable_epochs
         processed_epoch_set = processed_epoch_set - retryable_epochs
         if retryable_epochs:
@@ -261,8 +261,10 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
             # regenerated with a different window). Can't replay it
             # without the surrounding warmup context -- skip and move on
             # rather than silently mis-mapping it to the wrong bar.
-            print(f"[{label}] bar epoch {bar_epoch} not found in current candle set, skipping.")
+            print(f"[{label}] bar epoch {bar_epoch} not found in current candle set, dropping.")
             processed_epoch_set.add(bar_epoch)
+            dropped_bar_epochs.add(bar_epoch)
+            skipped_bar_epochs.discard(bar_epoch)
             continue
 
         row = out.loc[bi]
