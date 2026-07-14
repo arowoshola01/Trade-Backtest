@@ -25,6 +25,14 @@ def build_message(label: str, progress_count: int, total: int, trades: int, even
             f"Trades recorded: {trades}\n"
             f"Progress: {percent:.1f}%"
         )
+    elif event == "analysis":
+        subject = f"[Backtest] {label} analysis summary"
+        body = (
+            f"Checkpoint analysis completed for {label}.\n"
+            f"Processed bars: {progress_count}/{total}\n"
+            f"Trades saved: {trades}\n"
+            f"Progress: {percent:.1f}%"
+        )
     else:
         subject = f"[Backtest] {label} progress update"
         body = (
@@ -64,4 +72,93 @@ def send_email(label: str, progress_count: int, total: int, trades: int, event: 
         return True
     except Exception as exc:
         print(f"[email] failed to send notification: {exc}")
+        return False
+
+
+def build_summary_message(items: list[tuple], event: str) -> tuple[str, str]:
+    if event == "done":
+        subject = "[Backtest] aggregate run completed"
+        body_lines = ["Backtest run completed.", ""]
+    else:
+        subject = "[Backtest] aggregate progress update"
+        body_lines = ["Backtest progress update.", ""]
+
+    for label, processed, total, trades in items:
+        percent = (processed / total * 100.0) if total else 100.0
+        body_lines.append(f"{label}: {processed}/{total} bars ({percent:.1f}%), {trades} trades")
+
+    return subject, "\n".join(body_lines)
+
+
+def send_summary_email(items: list[tuple], event: str = "checkpoint") -> bool:
+    if not is_configured():
+        return False
+
+    subject, body = build_summary_message(items, event)
+
+    smtp_host = os.getenv("BACKTEST_SMTP_HOST")
+    smtp_port = int(os.getenv("BACKTEST_SMTP_PORT", "587"))
+    smtp_user = os.getenv("BACKTEST_SMTP_USERNAME")
+    smtp_password = os.getenv("BACKTEST_SMTP_PASSWORD")
+    smtp_from = os.getenv("BACKTEST_SMTP_FROM")
+    smtp_to = os.getenv("BACKTEST_SMTP_TO")
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = smtp_from
+    msg["To"] = smtp_to
+    msg.set_content(body)
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            if smtp_user and smtp_password:
+                server.login(smtp_user, smtp_password)
+            server.send_message(msg)
+        return True
+    except Exception as exc:
+        print(f"[email] failed to send summary notification: {exc}")
+        return False
+
+
+def build_analysis_summary_message(items: list[dict]) -> tuple[str, str]:
+    subject = "[Backtest] analyze checkpoints summary"
+    lines = ["Checkpoint analysis summary.", ""]
+    for item in items:
+        lines.append(f"{item['label']}: {item['processed']}/{item['total']} bars ({item['progress']:.1f}%), {item['trades']} trades")
+        if item.get('combo_counts'):
+            lines.append(f"  combos: {item['combo_counts']}")
+        if item.get('category_counts'):
+            lines.append(f"  categories: {item['category_counts']}")
+    return subject, "\n".join(lines)
+
+
+def send_analysis_summary_email(items: list[dict]) -> bool:
+    if not is_configured():
+        return False
+
+    subject, body = build_analysis_summary_message(items)
+
+    smtp_host = os.getenv("BACKTEST_SMTP_HOST")
+    smtp_port = int(os.getenv("BACKTEST_SMTP_PORT", "587"))
+    smtp_user = os.getenv("BACKTEST_SMTP_USERNAME")
+    smtp_password = os.getenv("BACKTEST_SMTP_PASSWORD")
+    smtp_from = os.getenv("BACKTEST_SMTP_FROM")
+    smtp_to = os.getenv("BACKTEST_SMTP_TO")
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = smtp_from
+    msg["To"] = smtp_to
+    msg.set_content(body)
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            if smtp_user and smtp_password:
+                server.login(smtp_user, smtp_password)
+            server.send_message(msg)
+        return True
+    except Exception as exc:
+        print(f"[email] failed to send analysis summary notification: {exc}")
         return False
