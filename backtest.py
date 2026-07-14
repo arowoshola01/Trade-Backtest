@@ -30,7 +30,7 @@ from pipeline import run_pipeline
 from tick_replay import find_entry_tick, find_settlement_price, iter_bar_ticks
 from strategy import StrategyConfig
 import checkpoint as ckpt
-from email_notifier import send_summary_email, should_notify
+from email_notifier import send_final_results_email, send_summary_email, should_notify
 
 
 TICK_PACE_DELAY = 0.3  # seconds between per-bar tick pulls, conservative default
@@ -38,6 +38,24 @@ CHECKPOINT_EVERY = 10  # save progress every N processed bars
 RECONNECT_MAX_ATTEMPTS = 5
 RECONNECT_BACKOFF_BASE = 2   # seconds; exponential: 2, 4, 8, 16, 32 -- for dropped connections
 RATE_LIMIT_BACKOFF_BASE = 3  # seconds; exponential: 3, 6, 12, 24, 48 -- for Deriv's "RateLimit" error
+
+
+def format_final_results_for_email(df, row_type: str) -> str:
+    if row_type == "combo":
+        header = "config | duration | combo | W/L/T | win_rate_pct"
+        rows = [
+            f"{row['config']} | {int(row['duration_min'])} | {row['combo']} | "
+            f"{int(row['wins'])}/{int(row['losses'])}/{int(row['trades'])} | {row['win_rate_pct']:.2f}%"
+            for _, row in df.iterrows()
+        ]
+    else:
+        header = "config | duration | category | W/L/T | win_rate_pct"
+        rows = [
+            f"{row['config']} | {int(row['duration_min'])} | {row['category']} | "
+            f"{int(row['wins'])}/{int(row['losses'])}/{int(row['trades'])} | {row['win_rate_pct']:.2f}%"
+            for _, row in df.iterrows()
+        ]
+    return "\n".join([header, "-" * len(header)] + rows)
 
 
 class BacktestConnectionError(Exception):
@@ -426,8 +444,8 @@ async def main():
     combo_df.to_csv("backtest_combo_results.csv", index=False)
     category_df.to_csv("backtest_category_results.csv", index=False)
 
-    combo_text = combo_df.to_string(index=False)
-    category_text = category_df.to_string(index=False)
+    combo_text = format_final_results_for_email(combo_df, "combo")
+    category_text = format_final_results_for_email(category_df, "category")
     send_final_results_email(combo_text, category_text)
 
     print("\n\n===== COMBO RESULTS (mutually exclusive, sums to total trades) =====")

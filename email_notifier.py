@@ -15,6 +15,17 @@ def should_notify(progress_count: int, notify_every: int = 50) -> bool:
     return progress_count > 0 and progress_count % notify_every == 0
 
 
+def format_table(rows: list[list[str]], headers: list[str]) -> str:
+    if rows:
+        col_widths = [max(len(str(item)) for item in column) for column in zip(headers, *rows)]
+    else:
+        col_widths = [len(h) for h in headers]
+    header_row = " | ".join(header.ljust(width) for header, width in zip(headers, col_widths))
+    separator = "-+-".join("-" * width for width in col_widths)
+    body_rows = [" | ".join(str(value).ljust(width) for value, width in zip(row, col_widths)) for row in rows]
+    return "\n".join([header_row, separator] + body_rows)
+
+
 def build_message(label: str, progress_count: int, total: int, trades: int, event: str) -> str:
     percent = (progress_count / total * 100.0) if total else 100.0
     if event == "done":
@@ -85,16 +96,22 @@ def send_raw_email(subject: str, body: str) -> bool:
 def build_summary_message(items: list[tuple], event: str) -> tuple[str, str]:
     if event == "done":
         subject = "[Backtest] aggregate run completed"
-        body_lines = ["Backtest run completed.", ""]
+        header = "Backtest run completed."
     else:
         subject = "[Backtest] aggregate checkpoint progress update"
-        body_lines = ["Backtest checkpoint progress update.", ""]
+        header = "Backtest checkpoint progress update."
 
+    rows = []
     for label, processed, total, trades in items:
         percent = (processed / total * 100.0) if total else 100.0
-        body_lines.append(f"{label}: {processed}/{total} bars ({percent:.1f}%), {trades} trades")
+        rows.append([label, f"{processed}/{total}", f"{percent:.1f}%", str(trades)])
 
-    return subject, "\n".join(body_lines)
+    body = "\n".join([
+        header,
+        "",
+        format_table(rows, ["config", "processed/total", "progress", "trades"]),
+    ])
+    return subject, body
 
 
 def send_summary_email(items: list[tuple], event: str = "checkpoint") -> bool:
@@ -127,14 +144,38 @@ def send_final_results_email(combo_body: str, category_body: str) -> bool:
 
 def build_analysis_summary_message(items: list[dict]) -> tuple[str, str]:
     subject = "[Backtest] analyze checkpoints summary"
-    lines = ["Checkpoint analysis summary.", ""]
+    rows = []
+    detail_lines = []
     for item in items:
-        lines.append(f"{item['label']}: {item['processed']}/{item['total']} bars ({item['progress']:.1f}%), {item['trades']} trades")
+        rows.append([
+            item['label'],
+            f"{item['processed']}/{item['total']}",
+            f"{item['progress']:.1f}%",
+            str(item['trades']),
+        ])
+
+        item_details = []
         if item.get('combo_counts'):
-            lines.append(f"  combos: {item['combo_counts']}")
+            item_details.append(f"{item['label']} combos:")
+            for combo, count in item['combo_counts'].items():
+                item_details.append(f"  {combo}: {count}")
         if item.get('category_counts'):
-            lines.append(f"  categories: {item['category_counts']}")
-    return subject, "\n".join(lines)
+            item_details.append(f"{item['label']} categories:")
+            for category, count in item['category_counts'].items():
+                item_details.append(f"  {category}: {count}")
+
+        if item_details:
+            detail_lines.extend(item_details + [""])
+
+    body_lines = [
+        "Checkpoint analysis summary.",
+        "",
+        format_table(rows, ["file", "processed/total", "progress", "trades"]),
+    ]
+    if detail_lines:
+        body_lines.extend(["", "Details:", ""] + detail_lines)
+
+    return subject, "\n".join(body_lines)
 
 
 def send_analysis_summary_email(items: list[dict]) -> bool:
@@ -142,27 +183,4 @@ def send_analysis_summary_email(items: list[dict]) -> bool:
         return False
 
     subject, body = build_analysis_summary_message(items)
-
-    smtp_host = os.getenv("BACKTEST_SMTP_HOST")
-    smtp_port = int(os.getenv("BACKTEST_SMTP_PORT", "587"))
-    smtp_user = os.getenv("BACKTEST_SMTP_USERNAME")
-    smtp_password = os.getenv("BACKTEST_SMTP_PASSWORD")
-    smtp_from = os.getenv("BACKTEST_SMTP_FROM")
-    smtp_to = os.getenv("BACKTEST_SMTP_TO")
-
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = smtp_from
-    msg["To"] = smtp_to
-    msg.set_content(body)
-
-    try:
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
-            if smtp_user and smtp_password:
-                server.login(smtp_user, smtp_password)
-            server.send_message(msg)
-        return True
-    except Exception as exc:
-        print(f"[email] failed to send analysis summary notification: {exc}")
-        return False
+    return send_raw_email(subject, body)
