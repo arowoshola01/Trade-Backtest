@@ -426,10 +426,14 @@ async def main():
     combo_df.to_csv("backtest_combo_results.csv", index=False)
     category_df.to_csv("backtest_category_results.csv", index=False)
 
+    combo_text = combo_df.to_string(index=False)
+    category_text = category_df.to_string(index=False)
+    send_final_results_email(combo_text, category_text)
+
     print("\n\n===== COMBO RESULTS (mutually exclusive, sums to total trades) =====")
-    print(combo_df.to_string(index=False))
+    print(combo_text)
     print("\n\n===== PER-CATEGORY RESULTS (inclusive, overlaps counted in each) =====")
-    print(category_df.to_string(index=False))
+    print(category_text)
     print("\nSaved: backtest_combo_results.csv, backtest_category_results.csv")
 
 

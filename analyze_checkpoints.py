@@ -2,12 +2,12 @@ import argparse
 import json
 from pathlib import Path
 from collections import Counter
-from email_notifier import send_analysis_summary_email, is_configured
+from email_notifier import send_raw_email, is_configured
 
 
 def analyze_dir(base: Path, do_email: bool = False):
     any_found = False
-    analysis_items = []
+    report_lines = []
     for path in sorted(base.glob('checkpoint_*.json')):
         any_found = True
         with open(path, 'r') as f:
@@ -16,6 +16,11 @@ def analyze_dir(base: Path, do_email: bool = False):
         processed = state.get('processed_bar_epochs', [])
         trades = state.get('trades', [])
         label = path.name[len('checkpoint_'):-len('.json')]
+        report_lines.append(f'FILE: {path.name}')
+        report_lines.append(f'  flagged bars: {len(flagged)}')
+        report_lines.append(f'  processed bars: {len(processed)}')
+        report_lines.append(f'  progress: {round(100 * len(processed) / len(flagged), 2) if flagged else None}%')
+        report_lines.append(f'  trades saved: {len(trades)}')
         print(f'FILE: {path.name}')
         print(f'  flagged bars: {len(flagged)}')
         print(f'  processed bars: {len(processed)}')
@@ -33,6 +38,9 @@ def analyze_dir(base: Path, do_email: bool = False):
                     dur_int = int(dur)
                     outcome_counts[dur_int] += 1
                     win_loss[(dur_int, bool(win))] += 1
+            report_lines.append(f'  combo counts: {dict(combo_counts)}')
+            report_lines.append(f'  category counts: {dict(cat_counts)}')
+            report_lines.append(f'  durations with outcomes: {dict(sorted(outcome_counts.items()))}')
             print('  combo counts:', dict(combo_counts))
             print('  category counts:', dict(cat_counts))
             print('  durations with outcomes:', dict(sorted(outcome_counts.items())))
@@ -41,26 +49,16 @@ def analyze_dir(base: Path, do_email: bool = False):
                 losses = win_loss[(dur, False)]
                 total = wins + losses
                 rate = round(100 * wins / total, 2) if total else None
+                report_lines.append(f'    duration {dur} min: {wins}W/{losses}L ({rate}%)')
                 print(f'    duration {dur} min: {wins}W/{losses}L ({rate}%)')
+        report_lines.append('')
         print()
-
-        if do_email:
-            processed_count = len(processed)
-            total_count = len(flagged)
-            trades_count = len(trades)
-            analysis_items.append({
-                'label': label,
-                'processed': processed_count,
-                'total': total_count,
-                'trades': trades_count,
-                'progress': round(100 * processed_count / total_count, 2) if total_count else 100.0,
-                'combo_counts': dict(Counter(t.get('combo') for t in trades)),
-                'category_counts': dict(Counter(cat for t in trades for cat in t.get('categories', []))),
-            })
 
     if do_email:
         if is_configured():
-            ok = send_analysis_summary_email(analysis_items)
+            subject = '[Backtest] analyze checkpoints summary'
+            body = '\n'.join(report_lines)
+            ok = send_raw_email(subject, body)
             print(f'email sent: {ok}')
         else:
             print('email skipped: SMTP not configured')

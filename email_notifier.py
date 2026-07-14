@@ -50,6 +50,13 @@ def send_email(label: str, progress_count: int, total: int, trades: int, event: 
 
     subject, body = build_message(label, progress_count, total, trades, event)
 
+    return send_raw_email(subject, body)
+
+
+def send_raw_email(subject: str, body: str) -> bool:
+    if not is_configured():
+        return False
+
     smtp_host = os.getenv("BACKTEST_SMTP_HOST")
     smtp_port = int(os.getenv("BACKTEST_SMTP_PORT", "587"))
     smtp_user = os.getenv("BACKTEST_SMTP_USERNAME")
@@ -80,8 +87,8 @@ def build_summary_message(items: list[tuple], event: str) -> tuple[str, str]:
         subject = "[Backtest] aggregate run completed"
         body_lines = ["Backtest run completed.", ""]
     else:
-        subject = "[Backtest] aggregate progress update"
-        body_lines = ["Backtest progress update.", ""]
+        subject = "[Backtest] aggregate checkpoint progress update"
+        body_lines = ["Backtest checkpoint progress update.", ""]
 
     for label, processed, total, trades in items:
         percent = (processed / total * 100.0) if total else 100.0
@@ -95,30 +102,27 @@ def send_summary_email(items: list[tuple], event: str = "checkpoint") -> bool:
         return False
 
     subject, body = build_summary_message(items, event)
+    return send_raw_email(subject, body)
 
-    smtp_host = os.getenv("BACKTEST_SMTP_HOST")
-    smtp_port = int(os.getenv("BACKTEST_SMTP_PORT", "587"))
-    smtp_user = os.getenv("BACKTEST_SMTP_USERNAME")
-    smtp_password = os.getenv("BACKTEST_SMTP_PASSWORD")
-    smtp_from = os.getenv("BACKTEST_SMTP_FROM")
-    smtp_to = os.getenv("BACKTEST_SMTP_TO")
 
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = smtp_from
-    msg["To"] = smtp_to
-    msg.set_content(body)
+def build_final_results_message(combo_body: str, category_body: str) -> tuple[str, str]:
+    subject = "[Backtest] final run results"
+    body_lines = [
+        "===== COMBO RESULTS (mutually exclusive, sums to total trades) =====",
+        combo_body,
+        "",
+        "===== PER-CATEGORY RESULTS (inclusive, overlaps counted in each) =====",
+        category_body,
+    ]
+    return subject, "\n".join(body_lines)
 
-    try:
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
-            if smtp_user and smtp_password:
-                server.login(smtp_user, smtp_password)
-            server.send_message(msg)
-        return True
-    except Exception as exc:
-        print(f"[email] failed to send summary notification: {exc}")
+
+def send_final_results_email(combo_body: str, category_body: str) -> bool:
+    if not is_configured():
         return False
+
+    subject, body = build_final_results_message(combo_body, category_body)
+    return send_raw_email(subject, body)
 
 
 def build_analysis_summary_message(items: list[dict]) -> tuple[str, str]:
