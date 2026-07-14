@@ -1,8 +1,12 @@
+import os
+import sys
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from pipeline import run_pipeline
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "Trade"))
+from Trade.pipeline import run_pipeline
 
 st.set_page_config(page_title="Trade Strategy Demo", page_icon="📈", layout="wide")
 
