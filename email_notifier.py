@@ -1,3 +1,4 @@
+import html
 import mimetypes
 import os
 import smtplib
@@ -65,6 +66,11 @@ def send_email(label: str, progress_count: int, total: int, trades: int, event: 
     return send_raw_email(subject, body)
 
 
+def build_html_body(body: str) -> str:
+    escaped = html.escape(body)
+    return f"<html><body><pre style='font-family:Menlo,Monaco,Consolas,monospace; white-space:pre-wrap;'>" + escaped + "</pre></body></html>"
+
+
 def send_raw_email(subject: str, body: str) -> bool:
     if not is_configured():
         return False
@@ -81,6 +87,7 @@ def send_raw_email(subject: str, body: str) -> bool:
     msg["From"] = smtp_from
     msg["To"] = smtp_to
     msg.set_content(body)
+    msg.add_alternative(build_html_body(body), subtype="html")
 
     try:
         with smtplib.SMTP(smtp_host, smtp_port) as server:
@@ -110,6 +117,7 @@ def send_email_with_attachments(subject: str, body: str, attachment_paths: list[
     msg["From"] = smtp_from
     msg["To"] = smtp_to
     msg.set_content(body)
+    msg.add_alternative(build_html_body(body), subtype="html")
 
     for path in attachment_paths:
         try:
