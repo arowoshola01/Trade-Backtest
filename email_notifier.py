@@ -24,21 +24,29 @@ def load_smtp_env_from_app_password(app_password_path: str = "app password.md") 
         return
 
     with open(app_password_path, "r", encoding="utf-8") as f:
-        password = f.readline().strip()
+        lines = [line.strip() for line in f if line.strip()]
 
-    if not password:
+    if not lines:
         return
+
+    password = lines[0]
+    email_address = lines[1] if len(lines) > 1 else None
 
     os.environ.setdefault("BACKTEST_SMTP_PASSWORD", password)
     os.environ.setdefault("BACKTEST_SMTP_HOST", "smtp.gmail.com")
     os.environ.setdefault("BACKTEST_SMTP_PORT", "587")
 
-    if os.getenv("BACKTEST_SMTP_FROM") and not os.getenv("BACKTEST_SMTP_USERNAME"):
-        os.environ.setdefault("BACKTEST_SMTP_USERNAME", os.getenv("BACKTEST_SMTP_FROM"))
-    if os.getenv("BACKTEST_SMTP_USERNAME") and not os.getenv("BACKTEST_SMTP_FROM"):
-        os.environ.setdefault("BACKTEST_SMTP_FROM", os.getenv("BACKTEST_SMTP_USERNAME"))
-    if os.getenv("BACKTEST_SMTP_FROM") and not os.getenv("BACKTEST_SMTP_TO"):
-        os.environ.setdefault("BACKTEST_SMTP_TO", os.getenv("BACKTEST_SMTP_FROM"))
+    if email_address:
+        os.environ.setdefault("BACKTEST_SMTP_FROM", email_address)
+        os.environ.setdefault("BACKTEST_SMTP_USERNAME", email_address)
+        os.environ.setdefault("BACKTEST_SMTP_TO", email_address)
+    else:
+        if os.getenv("BACKTEST_SMTP_FROM") and not os.getenv("BACKTEST_SMTP_USERNAME"):
+            os.environ.setdefault("BACKTEST_SMTP_USERNAME", os.getenv("BACKTEST_SMTP_FROM"))
+        if os.getenv("BACKTEST_SMTP_USERNAME") and not os.getenv("BACKTEST_SMTP_FROM"):
+            os.environ.setdefault("BACKTEST_SMTP_FROM", os.getenv("BACKTEST_SMTP_USERNAME"))
+        if os.getenv("BACKTEST_SMTP_FROM") and not os.getenv("BACKTEST_SMTP_TO"):
+            os.environ.setdefault("BACKTEST_SMTP_TO", os.getenv("BACKTEST_SMTP_FROM"))
 
 
 def should_notify(progress_count: int, notify_every: int = 50) -> bool:

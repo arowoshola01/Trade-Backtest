@@ -2,7 +2,7 @@ import argparse
 import json
 from pathlib import Path
 from collections import Counter
-from email_notifier import send_raw_email, is_configured
+from email_notifier import load_smtp_env_from_app_password, send_raw_email, is_configured
 
 
 def analyze_dir(base: Path, do_email: bool = False):
@@ -55,6 +55,7 @@ def analyze_dir(base: Path, do_email: bool = False):
         print()
 
     if do_email:
+        load_smtp_env_from_app_password()
         if is_configured():
             subject = '[Backtest] analyze checkpoints summary'
             body = '\n'.join(report_lines)
