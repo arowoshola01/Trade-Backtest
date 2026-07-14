@@ -33,6 +33,7 @@ from tick_replay import find_entry_tick, find_settlement_price, iter_bar_ticks
 from strategy import StrategyConfig
 import checkpoint as ckpt
 from email_notifier import (
+    is_configured,
     load_smtp_env_from_app_password,
     send_email_with_attachments,
     send_final_results_email,
