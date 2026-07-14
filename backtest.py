@@ -30,6 +30,7 @@ from pipeline import run_pipeline
 from tick_replay import find_entry_tick, find_settlement_price, iter_bar_ticks
 from strategy import StrategyConfig
 import checkpoint as ckpt
+from email_notifier import send_email, should_notify
 
 
 TICK_PACE_DELAY = 0.3  # seconds between per-bar tick pulls, conservative default
@@ -308,6 +309,8 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
                                  skipped_bar_epochs=list(skipped_bar_epochs),
                                  dropped_bar_epochs=list(dropped_bar_epochs))
             print(f"[{label}]   (checkpoint saved: {len(processed_epoch_set)}/{total} processed, {len(trades)} trades)")
+            if should_notify(len(processed_epoch_set), 50):
+                send_email(label, len(processed_epoch_set), total, len(trades), event="checkpoint")
 
     # final save, covers any tail not divisible by CHECKPOINT_EVERY
     ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
@@ -392,6 +395,15 @@ async def main():
             pass
 
     combo_df, category_df = build_results_tables(all_results)
+
+    for label in all_results:
+        state = ckpt.load_checkpoint(label)
+        if state is None:
+            continue
+        processed_count = len(state.get("processed_bar_epochs", []))
+        total_count = len(state.get("flagged_bar_epochs", []))
+        trades_count = len(state.get("trades", []))
+        send_email(label, processed_count, total_count, trades_count, event="done")
 
     combo_df.to_csv("backtest_combo_results.csv", index=False)
     category_df.to_csv("backtest_category_results.csv", index=False)
