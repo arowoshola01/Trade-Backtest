@@ -1,3 +1,4 @@
+import mimetypes
 import os
 import smtplib
 from email.message import EmailMessage
@@ -80,6 +81,49 @@ def send_raw_email(subject: str, body: str) -> bool:
     msg["From"] = smtp_from
     msg["To"] = smtp_to
     msg.set_content(body)
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            if smtp_user and smtp_password:
+                server.login(smtp_user, smtp_password)
+            server.send_message(msg)
+        return True
+    except Exception as exc:
+        print(f"[email] failed to send notification: {exc}")
+        return False
+
+
+def send_email_with_attachments(subject: str, body: str, attachment_paths: list[str]) -> bool:
+    if not is_configured():
+        return False
+
+    smtp_host = os.getenv("BACKTEST_SMTP_HOST")
+    smtp_port = int(os.getenv("BACKTEST_SMTP_PORT", "587"))
+    smtp_user = os.getenv("BACKTEST_SMTP_USERNAME")
+    smtp_password = os.getenv("BACKTEST_SMTP_PASSWORD")
+    smtp_from = os.getenv("BACKTEST_SMTP_FROM")
+    smtp_to = os.getenv("BACKTEST_SMTP_TO")
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = smtp_from
+    msg["To"] = smtp_to
+    msg.set_content(body)
+
+    for path in attachment_paths:
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            ctype, encoding = mimetypes.guess_type(path)
+            if ctype:
+                maintype, subtype = ctype.split("/", 1)
+            else:
+                maintype, subtype = "application", "octet-stream"
+            msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=os.path.basename(path))
+        except Exception as exc:
+            print(f"[email] failed to attach {path}: {exc}")
+            return False
 
     try:
         with smtplib.SMTP(smtp_host, smtp_port) as server:

@@ -18,6 +18,7 @@ run inside Claude's sandbox -- run it on your own machine:
 """
 
 import asyncio
+import glob
 import time
 from collections import defaultdict
 
@@ -30,7 +31,7 @@ from pipeline import run_pipeline
 from tick_replay import find_entry_tick, find_settlement_price, iter_bar_ticks
 from strategy import StrategyConfig
 import checkpoint as ckpt
-from email_notifier import send_final_results_email, send_summary_email, should_notify
+from email_notifier import send_email_with_attachments, send_final_results_email, send_summary_email, should_notify
 
 
 TICK_PACE_DELAY = 0.3  # seconds between per-bar tick pulls, conservative default
@@ -447,6 +448,18 @@ async def main():
     combo_text = format_final_results_for_email(combo_df, "combo")
     category_text = format_final_results_for_email(category_df, "category")
     send_final_results_email(combo_text, category_text)
+
+    checkpoint_csvs = sorted(glob.glob("backtest_checkpoints/*.csv"))
+    checkpoint_jsons = sorted(glob.glob("backtest_checkpoints/*.json"))
+    result_csvs = ["backtest_combo_results.csv", "backtest_category_results.csv"]
+    attachment_paths = checkpoint_csvs + checkpoint_jsons + result_csvs
+    if attachment_paths:
+        attachment_list = "\n".join(f"- {path}" for path in attachment_paths)
+        send_email_with_attachments(
+            "[Backtest] backtest report attachments",
+            "Attached are the backtest checkpoint and result files:\n\n" + attachment_list,
+            attachment_paths,
+        )
 
     print("\n\n===== COMBO RESULTS (mutually exclusive, sums to total trades) =====")
     print(combo_text)
