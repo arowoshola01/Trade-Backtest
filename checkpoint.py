@@ -71,7 +71,8 @@ def load_checkpoint(label: str):
     return state
 
 
-def save_checkpoint(label: str, flagged_bar_epochs: list, processed_bar_epochs: list, trades: list):
+def save_checkpoint(label: str, flagged_bar_epochs: list, processed_bar_epochs: list, trades: list,
+                    skipped_bar_epochs: list | None = None, dropped_bar_epochs: list | None = None):
     """
     Atomic save. flagged_bar_epochs / processed_bar_epochs are lists of
     candle OPEN EPOCHS (not positional indices) -- see load_checkpoint
@@ -90,6 +91,8 @@ def save_checkpoint(label: str, flagged_bar_epochs: list, processed_bar_epochs: 
         "flagged_bar_epochs": [int(e) for e in flagged_bar_epochs],
         "processed_bar_epochs": [int(e) for e in processed_bar_epochs],
         "trades": serializable_trades,
+        "skipped_bar_epochs": [int(e) for e in (skipped_bar_epochs or [])],
+        "dropped_bar_epochs": [int(e) for e in (dropped_bar_epochs or [])],
     }
 
     path = checkpoint_path(label)

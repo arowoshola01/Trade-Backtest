@@ -183,7 +183,16 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
     if state is not None:
         flagged_bar_epochs = state["flagged_bar_epochs"]
         processed_epoch_set = set(state["processed_bar_epochs"])
+        skipped_bar_epochs = set(state.get("skipped_bar_epochs", []))
+        dropped_bar_epochs = set(state.get("dropped_bar_epochs", []))
         trades = state["trades"]
+
+        completed_trade_epochs = {int(t["bar_epoch"]) for t in trades}
+        legacy_retryable_epochs = {int(e) for e in processed_epoch_set if int(e) not in completed_trade_epochs}
+        retryable_epochs = skipped_bar_epochs | legacy_retryable_epochs
+        processed_epoch_set = processed_epoch_set - retryable_epochs
+        if retryable_epochs:
+            print(f"[{label}] Requeueing {len(retryable_epochs)} previously incomplete bar(s) for retry.")
         print(f"[{label}] Resuming from checkpoint: {len(processed_epoch_set)}/{len(flagged_bar_epochs)} "
               f"bar(s) already processed, {len(trades)} trade(s) so far.")
     else:
@@ -193,8 +202,12 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
         print(f"[{label}] {len(flagged)} bar(s) remain for Pass 2.")
         flagged_bar_epochs = [int(out.loc[bi, "epoch"]) for bi in flagged.index]
         processed_epoch_set = set()
+        skipped_bar_epochs = set()
+        dropped_bar_epochs = set()
         trades = []
-        ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades)
+        ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
+                             skipped_bar_epochs=list(skipped_bar_epochs),
+                             dropped_bar_epochs=list(dropped_bar_epochs))
 
     remaining_epochs = [e for e in flagged_bar_epochs if e not in processed_epoch_set]
     total = len(flagged_bar_epochs)
@@ -231,16 +244,21 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
             # re-running will resume from exactly this bar.
             print(f"\n[{label}] Connection could not be restored after {RECONNECT_MAX_ATTEMPTS} attempts. "
                   f"Stopping this config at bar@{bar_open_epoch} -- re-run to resume.")
-            ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades)
+            ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
+                                 skipped_bar_epochs=list(skipped_bar_epochs),
+                                 dropped_bar_epochs=list(dropped_bar_epochs))
             raise
         except Exception as e:
-            # A genuine, non-connection failure for this specific bar
-            # (e.g. malformed request, no data for that range) -- this IS
-            # a legitimate outcome for this bar, safe to mark processed.
+            # A genuine, non-connection failure for this specific bar is treated
+            # as an incomplete attempt rather than a completed outcome. Keep it
+            # unprocessed so a resumed run can retry it; only true "drop"
+            # cases (such as no entry tick found) are marked as processed.
             print(f"tick pull failed ({e}), skipping.")
-            processed_epoch_set.add(bar_epoch)
+            skipped_bar_epochs.add(bar_epoch)
             if n % CHECKPOINT_EVERY == 0:
-                ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades)
+                ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
+                                     skipped_bar_epochs=list(skipped_bar_epochs),
+                                     dropped_bar_epochs=list(dropped_bar_epochs))
             continue
         await asyncio.sleep(TICK_PACE_DELAY)
 
@@ -250,8 +268,12 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
         if entry is None:
             print("no entry tick found, dropping.")
             processed_epoch_set.add(bar_epoch)
+            dropped_bar_epochs.add(bar_epoch)
+            skipped_bar_epochs.discard(bar_epoch)
             if n % CHECKPOINT_EVERY == 0:
-                ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades)
+                ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
+                                     skipped_bar_epochs=list(skipped_bar_epochs),
+                                     dropped_bar_epochs=list(dropped_bar_epochs))
             continue
 
         ticks_after_entry = [t for t in ticks if t["epoch"] >= entry["epoch"]]
@@ -278,13 +300,19 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
             "combo": make_combo_label(entry["categories"]), "outcomes": outcomes,
         })
         processed_epoch_set.add(bar_epoch)
+        skipped_bar_epochs.discard(bar_epoch)
+        dropped_bar_epochs.discard(bar_epoch)
 
         if n % CHECKPOINT_EVERY == 0:
-            ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades)
+            ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
+                                 skipped_bar_epochs=list(skipped_bar_epochs),
+                                 dropped_bar_epochs=list(dropped_bar_epochs))
             print(f"[{label}]   (checkpoint saved: {len(processed_epoch_set)}/{total} processed, {len(trades)} trades)")
 
     # final save, covers any tail not divisible by CHECKPOINT_EVERY
-    ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades)
+    ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
+                         skipped_bar_epochs=list(skipped_bar_epochs),
+                         dropped_bar_epochs=list(dropped_bar_epochs))
 
     return trades, durations_min
 
