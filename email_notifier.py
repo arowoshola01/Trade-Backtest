@@ -16,6 +16,26 @@ def is_configured() -> bool:
     )
 
 
+def missing_smtp_env_vars() -> list[str]:
+    """Return the subset of BACKTEST_SMTP_* env vars that are unset/empty.
+
+    Useful for printing at the human-facing 'SMTP disabled' message in
+    backtest.py, so the user immediately sees which env var is the actual
+    problem (e.g. USERNAME vs. PASSWORD) instead of just 'incomplete'.
+    """
+    return [
+        name for name in (
+            "BACKTEST_SMTP_HOST",
+            "BACKTEST_SMTP_PORT",
+            "BACKTEST_SMTP_USERNAME",
+            "BACKTEST_SMTP_PASSWORD",
+            "BACKTEST_SMTP_FROM",
+            "BACKTEST_SMTP_TO",
+        )
+        if not os.getenv(name)
+    ]
+
+
 def load_smtp_env_from_app_password(app_password_path: str = "app password.md") -> None:
     if os.getenv("BACKTEST_SMTP_PASSWORD"):
         return

@@ -35,6 +35,7 @@ import checkpoint as ckpt
 from email_notifier import (
     is_configured,
     load_smtp_env_from_app_password,
+    missing_smtp_env_vars,
     send_email_with_attachments,
     send_final_results_email,
     send_summary_email,
@@ -412,7 +413,11 @@ async def main():
     if is_configured():
         print("SMTP email notifications are enabled.")
     else:
-        print("SMTP email notifications are disabled or incomplete; backtest will still run.")
+        missing = missing_smtp_env_vars()
+        if missing:
+            print(f"SMTP email notifications are disabled; missing env vars: {missing}. Backtest will still run.")
+        else:
+            print("SMTP email notifications are disabled or incomplete; backtest will still run.")
 
     client = DerivClient()
     await client.connect()
