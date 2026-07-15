@@ -33,6 +33,7 @@ from tick_replay import find_entry_tick, find_settlement_price, iter_bar_ticks
 from strategy import StrategyConfig
 import checkpoint as ckpt
 from email_notifier import (
+    format_table,
     is_configured,
     load_smtp_env_from_app_password,
     missing_smtp_env_vars,
@@ -52,20 +53,30 @@ RATE_LIMIT_BACKOFF_BASE = 3  # seconds; exponential: 3, 6, 12, 24, 48 -- for Der
 
 def format_final_results_for_email(df, row_type: str) -> str:
     if row_type == "combo":
-        header = "config | duration | combo | W/L/T | win_rate_pct"
+        headers = ["config", "duration", "combo", "W/L/T", "win_rate_pct"]
         rows = [
-            f"{row['config']} | {int(row['duration_min'])} | {row['combo']} | "
-            f"{int(row['wins'])}/{int(row['losses'])}/{int(row['trades'])} | {row['win_rate_pct']:.2f}%"
+            [
+                str(row["config"]),
+                str(int(row["duration_min"])),
+                str(row["combo"]),
+                f"{int(row['wins'])}/{int(row['losses'])}/{int(row['trades'])}",
+                f"{row['win_rate_pct']:.2f}%" if row["win_rate_pct"] is not None else "N/A",
+            ]
             for _, row in df.iterrows()
         ]
     else:
-        header = "config | duration | category | W/L/T | win_rate_pct"
+        headers = ["config", "duration", "category", "W/L/T", "win_rate_pct"]
         rows = [
-            f"{row['config']} | {int(row['duration_min'])} | {row['category']} | "
-            f"{int(row['wins'])}/{int(row['losses'])}/{int(row['trades'])} | {row['win_rate_pct']:.2f}%"
+            [
+                str(row["config"]),
+                str(int(row["duration_min"])),
+                str(row["category"]),
+                f"{int(row['wins'])}/{int(row['losses'])}/{int(row['trades'])}",
+                f"{row['win_rate_pct']:.2f}%" if row["win_rate_pct"] is not None else "N/A",
+            ]
             for _, row in df.iterrows()
         ]
-    return "\n".join([header, "-" * len(header)] + rows)
+    return format_table(rows, headers)
 
 
 class BacktestConnectionError(Exception):
