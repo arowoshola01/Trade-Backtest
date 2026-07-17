@@ -1,3 +1,4 @@
 {
-  "python.defaultInterpreterPath": "/home/codespace/.python/current/bin/python3"
+  "python.defaultInterpreterPath": "/home/codespace/.python/current/bin/python3",
+  "chat.byokUtilityModelDefault": "copilot"
 }
