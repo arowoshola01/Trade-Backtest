@@ -1,4 +1,5 @@
 {
   "python.defaultInterpreterPath": "/home/codespace/.python/current/bin/python3",
-  "chat.byokUtilityModelDefault": "copilot"
+  "chat.byokUtilityModelDefault": "copilot",
+  "nvidia-nim.showReasoning": true
 }
