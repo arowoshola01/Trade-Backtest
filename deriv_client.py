@@ -156,17 +156,19 @@ class DerivClient:
 
     async def get_candle_history_paginated(self, symbol: str = None, granularity: int = None,
                                             total_count: int = 8064, batch_size: int = 5000,
-                                            pace_delay: float = 0.3):
+                                            pace_delay: float = 0.3, end="latest"):
         """
         Pages backwards through candle history for spans longer than one
         request's cap. Returns oldest -> newest, deduplicated by epoch.
+        `end` can be 'latest' (default) or a specific epoch (int) to
+        start paging backward from -- used when extending an existing
+        cache with OLDER history instead of pulling the most recent span.
         """
         symbol = symbol or config.SYMBOL
         if granularity is None:
             granularity, _ = config.resolve_granularity_and_tf_cal()
 
         all_candles = []
-        end = "latest"
         seen_epochs = set()
 
         while len(all_candles) < total_count:

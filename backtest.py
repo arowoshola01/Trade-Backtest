@@ -32,23 +32,25 @@ from pipeline import run_pipeline
 from tick_replay import find_entry_tick, find_settlement_price, iter_bar_ticks
 from strategy import StrategyConfig
 import checkpoint as ckpt
+from network_retry import (call_with_reconnect, BacktestConnectionError, TICK_PACE_DELAY,
+                            RECONNECT_MAX_ATTEMPTS, RECONNECT_BACKOFF_BASE, RATE_LIMIT_BACKOFF_BASE)
+from cluster_trajectory import capture_cluster_trajectories
+import repaint_analysis
 from email_notifier import (
     format_table,
     is_configured,
     load_smtp_env_from_app_password,
     missing_smtp_env_vars,
+    send_email,
     send_email_with_attachments,
     send_final_results_email,
+    send_raw_email,
     send_summary_email,
     should_notify,
 )
 
 
-TICK_PACE_DELAY = 0.3  # seconds between per-bar tick pulls, conservative default
 CHECKPOINT_EVERY = 10  # save progress every N processed bars
-RECONNECT_MAX_ATTEMPTS = 5
-RECONNECT_BACKOFF_BASE = 2   # seconds; exponential: 2, 4, 8, 16, 32 -- for dropped connections
-RATE_LIMIT_BACKOFF_BASE = 3  # seconds; exponential: 3, 6, 12, 24, 48 -- for Deriv's "RateLimit" error
 
 
 def format_final_results_for_email(df, row_type: str) -> str:
@@ -77,61 +79,6 @@ def format_final_results_for_email(df, row_type: str) -> str:
             for _, row in df.iterrows()
         ]
     return format_table(rows, headers)
-
-
-class BacktestConnectionError(Exception):
-    """Raised when a network call fails even after exhausting reconnect attempts."""
-    pass
-
-
-async def call_with_reconnect(client: DerivClient, label: str, description: str,
-                               coro_func, *args, max_attempts: int = RECONNECT_MAX_ATTEMPTS, **kwargs):
-    """
-    Calls coro_func(*args, **kwargs) (an awaitable client method).
-
-    Two distinct failure modes get retried with backoff, up to
-    max_attempts each:
-      - Dropped connection (ConnectionClosed / OSError): waits, then
-        reconnects the client's WebSocket before retrying.
-      - Deriv's "RateLimit" API error: waits (no reconnect needed, the
-        socket itself is fine, just the request rate), then retries the
-        same request.
-
-    Any OTHER DerivAPIError (bad params, no data for that range, etc.) is
-    NOT retried -- retrying wouldn't fix it, so it propagates immediately
-    for the caller to treat as a genuine per-bar outcome.
-    """
-    last_exc = None
-    for attempt in range(max_attempts + 1):
-        try:
-            return await coro_func(*args, **kwargs)
-        except (websockets.exceptions.ConnectionClosed, OSError) as e:
-            last_exc = e
-            if attempt < max_attempts:
-                wait = RECONNECT_BACKOFF_BASE * (2 ** attempt)
-                print(f"\n[{label}] {description}: connection issue ({e}), "
-                      f"reconnecting (attempt {attempt + 1}/{max_attempts}) in {wait}s...")
-                await asyncio.sleep(wait)
-                try:
-                    await client.reconnect()
-                except Exception as reconnect_exc:
-                    print(f"[{label}] reconnect attempt failed: {reconnect_exc}")
-            else:
-                raise BacktestConnectionError(
-                    f"{label}: {description} failed after {max_attempts} reconnect attempts") from e
-        except DerivAPIError as e:
-            if e.code != "RateLimit":
-                raise  # genuine API-level rejection -- not retryable, let the caller handle it
-            last_exc = e
-            if attempt < max_attempts:
-                wait = RATE_LIMIT_BACKOFF_BASE * (2 ** attempt)
-                print(f"\n[{label}] {description}: rate limited, waiting {wait}s "
-                      f"(attempt {attempt + 1}/{max_attempts})...")
-                await asyncio.sleep(wait)
-            else:
-                raise BacktestConnectionError(
-                    f"{label}: {description} failed after {max_attempts} rate-limit retries") from e
-    raise BacktestConnectionError(f"{label}: {description} failed") from last_exc
 
 
 def make_combo_label(categories: list) -> str:
@@ -174,19 +121,6 @@ def drop_edge_of_data_bars(flagged: pd.DataFrame, df: pd.DataFrame, granularity:
     if dropped:
         print(f"  Dropped {dropped} edge-of-data bar(s) that couldn't be fully resolved.")
     return flagged[list(keep_mask)]
-
-
-def gather_checkpoint_summary():
-    summary_items = []
-    for label, _, _ in config.BACKTEST_CONFIGS:
-        state = ckpt.load_checkpoint(label)
-        if state is None:
-            continue
-        processed_count = len(state.get("processed_bar_epochs", []))
-        total_count = len(state.get("flagged_bar_epochs", []))
-        trades_count = len(state.get("trades", []))
-        summary_items.append((label, processed_count, total_count, trades_count))
-    return summary_items
 
 
 async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: str, tf_cal_override):
@@ -246,7 +180,9 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
         processed_epoch_set = processed_epoch_set - retryable_epochs
         if retryable_epochs:
             print(f"[{label}] Requeueing {len(retryable_epochs)} previously incomplete bar(s) for retry.")
-        print(f"[{label}] Resuming from checkpoint: {len(processed_epoch_set)}/{len(flagged_bar_epochs)} "
+        prior_clusters = len(state.get("cluster_trajectories", {}))
+        print(f"[{label}] From checkpoint: {len(flagged_bar_epochs)} bar(s) flagged, "
+              f"{prior_clusters} cluster captured, {len(processed_epoch_set)}/{len(flagged_bar_epochs)} "
               f"bar(s) already processed, {len(trades)} trade(s) so far.")
     else:
         flagged = out[out["decision"].notna()].copy()
@@ -260,11 +196,45 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
         trades = []
         ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
                              skipped_bar_epochs=list(skipped_bar_epochs),
-                             dropped_bar_epochs=list(dropped_bar_epochs))
+                             dropped_bar_epochs=list(dropped_bar_epochs),
+                             skipped_cluster_ids=[])
+
+    existing_trajectory_ids = set(state.get("cluster_trajectories", {}).keys()) if state is not None else set()
+    cluster_trajectories, epoch_to_cluster_id, skipped_cluster_ids = await capture_cluster_trajectories(
+        client, label, out, df, flagged_bar_epochs, existing_trajectory_ids, epoch_to_pos,
+        granularity, max_duration_sec, replay_pipeline_kwargs,
+        checkpoint_state=state,
+        processed_epoch_set=processed_epoch_set,
+        trades=trades,
+        skipped_bar_epochs=skipped_bar_epochs,
+        dropped_bar_epochs=dropped_bar_epochs)
+    if state is not None:
+        # preserve any trajectories captured in a prior (interrupted) run
+        existing_trajectories = state.get("cluster_trajectories", {})
+        cluster_trajectories = {**existing_trajectories, **cluster_trajectories}
+
+    if skipped_cluster_ids:
+        print(f"[{label}] {len(skipped_cluster_ids)} cluster(s) still at edge of history, will retry on next resume.")
+
+    # retroactively link any already-existing trades (from a prior partial
+    # run) to their cluster, now that we have a full epoch->cluster_id map
+    for t in trades:
+        be = int(t["bar_epoch"])
+        if be in epoch_to_cluster_id and t.get("cluster_id") != epoch_to_cluster_id[be]:
+            t["cluster_id"] = epoch_to_cluster_id[be]
+
+    if cluster_trajectories or any(t.get("cluster_id") for t in trades):
+        ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
+                             skipped_bar_epochs=list(skipped_bar_epochs),
+                             dropped_bar_epochs=list(dropped_bar_epochs),
+                             cluster_trajectories=cluster_trajectories,
+                             skipped_cluster_ids=list(skipped_cluster_ids))
 
     remaining_epochs = [e for e in flagged_bar_epochs if e not in processed_epoch_set]
     total = len(flagged_bar_epochs)
     initial_processed_count = len(processed_epoch_set)
+
+    print(f"[{label}] Running Pass 2 (replay pipeline)...")
 
     for n, bar_epoch in enumerate(remaining_epochs, start=1):
         bi = epoch_to_pos.get(bar_epoch)
@@ -287,34 +257,114 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
         settlement_buffer = max_duration_sec + 30
 
         done_count = initial_processed_count + n
-        print(f"[{label}] ({done_count}/{total}) bar@{bar_open_epoch} pulling ticks...", end=" ", flush=True)
-        try:
-            ticks = await call_with_reconnect(
-                client, label, f"tick pull bar@{bar_open_epoch}",
-                client.get_tick_history, count=2000, start=bar_open_epoch, end=bar_close_epoch + settlement_buffer)
-        except BacktestConnectionError:
-            # Connection could not be restored even after retries. Do NOT
-            # mark this bar as processed -- it was never actually
-            # evaluated. Save what's genuinely done and stop this config;
-            # re-running will resume from exactly this bar.
-            print(f"\n[{label}] Connection could not be restored after {RECONNECT_MAX_ATTEMPTS} attempts. "
-                  f"Stopping this config at bar@{bar_open_epoch} -- re-run to resume.")
-            ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
-                                 skipped_bar_epochs=list(skipped_bar_epochs),
-                                 dropped_bar_epochs=list(dropped_bar_epochs))
-            raise
-        except Exception as e:
-            # A genuine, non-connection failure for this specific bar is treated
-            # as an incomplete attempt rather than a completed outcome. Keep it
-            # unprocessed so a resumed run can retry it; only true "drop"
-            # cases (such as no entry tick found) are marked as processed.
-            print(f"tick pull failed ({e}), skipping.")
-            skipped_bar_epochs.add(bar_epoch)
-            if n % CHECKPOINT_EVERY == 0:
+        print(f"[{label}] ({done_count}/{total}) pulling ticks...", end=" ", flush=True)
+
+        # Try to reuse ticks from cluster capture if this bar belongs to a
+        # cluster and we have cached ticks that cover at least part of this
+        # bar's window. Three cases:
+        #   1. Cached window fully covers needed window → reuse only
+        #   2. Cached window partially covers → reuse cached + pull missing
+        #   3. No cached ticks or no overlap → pull fresh
+        ticks = None
+        reuse_mode = None  # "full", "partial", or None
+        cluster_id = epoch_to_cluster_id.get(bar_epoch)
+        needed_start = bar_open_epoch
+        needed_end = bar_close_epoch + settlement_buffer
+        if cluster_id is not None and cluster_id in cluster_trajectories:
+            traj = cluster_trajectories[cluster_id]
+            cached_ticks = traj.get("ticks")
+            window_start = traj.get("window_start")
+            window_end = traj.get("window_end")
+            if cached_ticks is not None and window_start is not None and window_end is not None:
+                if window_start <= needed_start and window_end >= needed_end:
+                    # Full coverage: cached window contains the needed window
+                    ticks = [t for t in cached_ticks if needed_start <= t["epoch"] <= needed_end]
+                    reuse_mode = "full"
+                elif window_end > needed_start and window_start < needed_end:
+                    # Partial overlap: use what's cached, pull the rest
+                    reuse_mode = "partial"
+                    # Use cached ticks that fall within the needed window
+                    cached_part = [t for t in cached_ticks if needed_start <= t["epoch"] <= needed_end]
+                    # Determine which sub-ranges are missing
+                    missing_ranges = []
+                    if window_start > needed_start:
+                        missing_ranges.append((needed_start, window_start))
+                    if window_end < needed_end:
+                        missing_ranges.append((window_end, needed_end))
+                    # Pull each missing range and merge
+                    pulled_parts = []
+                    partial_failed = False
+                    for ms, me in missing_ranges:
+                        try:
+                            part = await call_with_reconnect(
+                                client, label, f"tick pull bar@{bar_open_epoch} gap {ms}-{me}",
+                                client.get_tick_history, count=2000, start=ms, end=me)
+                            pulled_parts.extend(part)
+                        except BacktestConnectionError:
+                            # Connection death during partial pull — same
+                            # save-and-stop logic as the full-pull case.
+                            print(f"\n[{label}] Connection could not be restored after {RECONNECT_MAX_ATTEMPTS} attempts. "
+                                  f"Stopping this config at bar@{bar_open_epoch} -- re-run to resume.")
+                            ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
+                                                 skipped_bar_epochs=list(skipped_bar_epochs),
+                                                 dropped_bar_epochs=list(dropped_bar_epochs),
+                                                 cluster_trajectories=cluster_trajectories,
+                                                 skipped_cluster_ids=list(skipped_cluster_ids))
+                            raise
+                        except Exception as e:
+                            print(f"partial tick pull failed ({e}), skipping.")
+                            skipped_bar_epochs.add(bar_epoch)
+                            partial_failed = True
+                            break
+                    if partial_failed:
+                        if n % CHECKPOINT_EVERY == 0:
+                            ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
+                                                 skipped_bar_epochs=list(skipped_bar_epochs),
+                                                 dropped_bar_epochs=list(dropped_bar_epochs),
+                                                 cluster_trajectories=cluster_trajectories,
+                                                 skipped_cluster_ids=list(skipped_cluster_ids))
+                        continue
+                    # Merge cached + pulled, sort by epoch
+                    ticks = cached_part + pulled_parts
+                    ticks.sort(key=lambda t: t["epoch"])
+
+        if reuse_mode == "full":
+            print(f"reused cached ticks", end=" ", flush=True)
+        elif reuse_mode == "partial":
+            print(f"reusing cached ticks & pulling other ticks...", end=" ", flush=True)
+
+        if ticks is None:
+            try:
+                ticks = await call_with_reconnect(
+                    client, label, f"tick pull bar@{bar_open_epoch}",
+                    client.get_tick_history, count=2000, start=bar_open_epoch, end=bar_close_epoch + settlement_buffer)
+            except BacktestConnectionError:
+                # Connection could not be restored even after retries. Do NOT
+                # mark this bar as processed -- it was never actually
+                # evaluated. Save what's genuinely done and stop this config;
+                # re-running will resume from exactly this bar.
+                print(f"\n[{label}] Connection could not be restored after {RECONNECT_MAX_ATTEMPTS} attempts. "
+                      f"Stopping this config at bar@{bar_open_epoch} -- re-run to resume.")
                 ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
                                      skipped_bar_epochs=list(skipped_bar_epochs),
-                                     dropped_bar_epochs=list(dropped_bar_epochs))
-            continue
+                                     dropped_bar_epochs=list(dropped_bar_epochs),
+                                     cluster_trajectories=cluster_trajectories,
+                                     skipped_cluster_ids=list(skipped_cluster_ids))
+                raise
+            except Exception as e:
+                # A genuine, non-connection failure for this specific bar is treated
+                # as an incomplete attempt rather than a completed outcome. Keep it
+                # unprocessed so a resumed run can retry it; only true "drop"
+                # cases (such as no entry tick found) are marked as processed.
+                print(f"tick pull failed ({e}), skipping.")
+                skipped_bar_epochs.add(bar_epoch)
+                if n % CHECKPOINT_EVERY == 0:
+                    ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
+                                         skipped_bar_epochs=list(skipped_bar_epochs),
+                                         dropped_bar_epochs=list(dropped_bar_epochs),
+                                         cluster_trajectories=cluster_trajectories,
+                                         skipped_cluster_ids=list(skipped_cluster_ids))
+                continue
         await asyncio.sleep(TICK_PACE_DELAY)
 
         ticks_in_bar = list(iter_bar_ticks(
@@ -328,7 +378,9 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
             if n % CHECKPOINT_EVERY == 0:
                 ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
                                      skipped_bar_epochs=list(skipped_bar_epochs),
-                                     dropped_bar_epochs=list(dropped_bar_epochs))
+                                     dropped_bar_epochs=list(dropped_bar_epochs),
+                                     cluster_trajectories=cluster_trajectories,
+                                     skipped_cluster_ids=list(skipped_cluster_ids))
             continue
 
         ticks_after_entry = [t for t in ticks if t["epoch"] >= entry["epoch"]]
@@ -353,6 +405,7 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
             "bar_epoch": bar_epoch, "side": side, "entry_epoch": entry["epoch"],
             "entry_price": entry["price"], "categories": entry["categories"],
             "combo": make_combo_label(entry["categories"]), "outcomes": outcomes,
+            "cluster_id": epoch_to_cluster_id.get(bar_epoch),
         })
         processed_epoch_set.add(bar_epoch)
         skipped_bar_epochs.discard(bar_epoch)
@@ -361,19 +414,23 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
         if n % CHECKPOINT_EVERY == 0:
             ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
                                  skipped_bar_epochs=list(skipped_bar_epochs),
-                                 dropped_bar_epochs=list(dropped_bar_epochs))
+                                 dropped_bar_epochs=list(dropped_bar_epochs),
+                                 cluster_trajectories=cluster_trajectories,
+                                 skipped_cluster_ids=list(skipped_cluster_ids))
             print(f"[{label}]   (checkpoint saved: {len(processed_epoch_set)}/{total} processed, {len(trades)} trades)")
-            if should_notify(len(processed_epoch_set), 50):
-                summary_items = gather_checkpoint_summary()
-                if summary_items:
-                    send_summary_email(summary_items, event="checkpoint")
+
+        # Strict every-50-processed-bars notification, independent of the
+        # CHECKPOINT_EVERY cadence. Uses the processed count (not the
+        # iteration counter n) so skipped/dropped bars don't shift the
+        # notification boundary.
+        if should_notify(len(processed_epoch_set), 50):
+            summary_items = [(label, len(processed_epoch_set), total, len(trades))]
+            if summary_items:
+                send_summary_email(summary_items, event="checkpoint")
 
     # final save, covers any tail not divisible by CHECKPOINT_EVERY
-    ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
-                         skipped_bar_epochs=list(skipped_bar_epochs),
-                         dropped_bar_epochs=list(dropped_bar_epochs))
-
-    return trades, durations_min
+    ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades, skipped_bar_epochs=list(skipped_bar_epochs), dropped_bar_epochs=list(dropped_bar_epochs), cluster_trajectories=cluster_trajectories, skipped_cluster_ids=list(skipped_cluster_ids))
+    return trades, durations_min, len(processed_epoch_set)
 
 
 def build_results_tables(all_results: dict):
@@ -418,7 +475,143 @@ def build_results_tables(all_results: dict):
     return combo_df, category_df
 
 
+RECONCILE_ZONE_BARS = 300
+# Matches tick_replay.WARMUP_BARS. Bars within this many positions of the
+# OLD dataset's original start are the only ones whose Pass 1
+# classification could change when older history is prepended -- Pass 2
+# never looks further back than this per bar anyway, and the HMM/rolling
+# indicators converge well within this span. Everything beyond it is
+# provably unaffected by extending history further backward.
+
+
+async def extend_config_candles(client: DerivClient, label: str, chart_timeframe: str, tf_cal_override,
+                                  target_count: int):
+    """
+    Extends an existing candle cache backward to target_count candles,
+    reruns Pass 1 on the enlarged set, and reconciles the bounded
+    boundary zone (see RECONCILE_ZONE_BARS) against the existing Pass 2
+    checkpoint -- any bar whose classification changed gets un-marked and
+    requeued for a fresh Pass 2 pass; everything else is left untouched.
+    Does NOT run Pass 2 itself -- call run_config_backtest afterward (or
+    let main()'s normal loop do it) to process whatever's newly pending.
+    """
+    granularity, tf_cal = config.resolve_granularity_and_tf_cal(chart_timeframe, tf_cal_override)
+    durations_min = config.BACKTEST_DURATIONS_MIN[chart_timeframe]
+    max_duration_sec = max(durations_min) * 60
+
+    df_old = ckpt.load_candles_cache(label)
+    if df_old is None:
+        print(f"[{label}] No existing candle cache -- nothing to extend. Run a normal backtest first.")
+        return
+    df_old = df_old.sort_values("epoch").reset_index(drop=True)
+
+    current_count = len(df_old)
+    if current_count >= target_count:
+        print(f"[{label}] Already have {current_count} candles (>= target {target_count}). Nothing to extend.")
+        return
+
+    additional_needed = target_count - current_count
+    earliest_epoch = int(df_old["epoch"].iloc[0])
+    print(f"[{label}] Extending: have {current_count}, pulling {additional_needed} older candle(s) "
+          f"(target {target_count})...")
+
+    older = await call_with_reconnect(
+        client, label, "extend candle pull",
+        client.get_candle_history_paginated, granularity=granularity,
+        total_count=additional_needed, end=earliest_epoch - 1)
+    print(f"[{label}] Pulled {len(older)} older candle(s).")
+    if not older:
+        print(f"[{label}] No older history available from Deriv -- may have hit the retention limit.")
+        return
+
+    df_older = pd.DataFrame(older)
+    df_merged = pd.concat([df_older, df_old], ignore_index=True)
+    df_merged = df_merged.drop_duplicates(subset="epoch").sort_values("epoch").reset_index(drop=True)
+    ckpt.save_candles_cache(label, df_merged)
+    print(f"[{label}] Merged cache: {len(df_merged)} candles total "
+          f"(+{len(df_merged) - current_count} new).")
+
+    # ── recompute Pass 1 on the full merged set ──
+    pipeline_kwargs = dict(
+        tf_cal=tf_cal, movol_model=config.MOVOL_MODEL, seconds_per_bar=granularity,
+        movol_lookback_hours=config.MOVOL_LOOKBACK_HOURS,
+        strategy_cfg=StrategyConfig(threshold=config.SIGNAL_THRESHOLD),
+    )
+    out_new = run_pipeline(df_merged.drop(columns=["epoch"]), **pipeline_kwargs)
+    out_new["epoch"] = df_merged["epoch"].values
+
+    flagged_new = out_new[out_new["decision"].notna()].copy()
+    flagged_new = drop_edge_of_data_bars(flagged_new, df_merged, granularity, max_duration_sec)
+    new_flagged_epochs = {int(out_new.loc[bi, "epoch"]) for bi in flagged_new.index}
+    new_side_by_epoch = {
+        int(out_new.loc[bi, "epoch"]): ("buy" if out_new.loc[bi, "decision"] == "CALL" else "sell")
+        for bi in flagged_new.index
+    }
+
+    # ── load existing Pass 2 progress ──
+    state = ckpt.load_checkpoint(label)
+    if state is None:
+        old_flagged = set()
+        processed_epoch_set, skipped_bar_epochs, dropped_bar_epochs = set(), set(), set()
+        trades = []
+        cluster_trajectories = {}
+        skipped_cluster_ids = set()
+    else:
+        old_flagged = {int(e) for e in state["flagged_bar_epochs"]}
+        processed_epoch_set = {int(e) for e in state["processed_bar_epochs"]}
+        skipped_bar_epochs = {int(e) for e in state.get("skipped_bar_epochs", [])}
+        dropped_bar_epochs = {int(e) for e in state.get("dropped_bar_epochs", [])}
+        trades = state["trades"]
+        cluster_trajectories = state.get("cluster_trajectories", {})
+        skipped_cluster_ids = set(state.get("skipped_cluster_ids", []))
+        for t in trades:
+            t["outcomes"] = {int(k): v for k, v in t["outcomes"].items()}
+
+    # ── reconcile only the bounded boundary zone ──
+    boundary_epochs = {int(e) for e in df_old["epoch"].iloc[:RECONCILE_ZONE_BARS].values}
+    reconciled_away = set()
+
+    for epoch in boundary_epochs & old_flagged & processed_epoch_set:
+        old_trade = next((t for t in trades if int(t["bar_epoch"]) == epoch), None)
+        still_flagged = epoch in new_flagged_epochs
+        if not still_flagged:
+            changed = True
+        elif old_trade is not None:
+            changed = new_side_by_epoch.get(epoch) != old_trade["side"]
+        else:
+            # It was a permanent "no entry tick found" drop, which never
+            # recorded which side it was evaluating. Can't positively
+            # confirm the side is unchanged, so be conservative and
+            # requeue it rather than risk silently keeping a stale drop.
+            changed = True
+        if changed:
+            reconciled_away.add(epoch)
+
+    if reconciled_away:
+        print(f"[{label}] Reconciliation: {len(reconciled_away)} boundary bar(s) changed classification "
+              f"under the extended history -- requeuing for fresh Pass 2.")
+        trades = [t for t in trades if int(t["bar_epoch"]) not in reconciled_away]
+        processed_epoch_set -= reconciled_away
+        skipped_bar_epochs -= reconciled_away
+        dropped_bar_epochs -= reconciled_away
+    else:
+        print(f"[{label}] Reconciliation: no boundary bars changed classification.")
+
+    flagged_bar_epochs = sorted(new_flagged_epochs)
+    ckpt.save_checkpoint(label, flagged_bar_epochs, list(processed_epoch_set), trades,
+                         skipped_bar_epochs=list(skipped_bar_epochs),
+                         dropped_bar_epochs=list(dropped_bar_epochs),
+                         cluster_trajectories=cluster_trajectories,
+                         skipped_cluster_ids=list(skipped_cluster_ids))
+    pending = len(flagged_bar_epochs) - len(processed_epoch_set)
+    print(f"[{label}] Extend complete: {len(flagged_bar_epochs)} total flagged bar(s), "
+          f"{len(processed_epoch_set)} already resolved, {pending} pending for Pass 2.\n")
+
+
 async def main():
+    import sys
+    do_extend = "--extend" in sys.argv
+
     load_smtp_env_from_app_password()
 
     if is_configured():
@@ -431,14 +624,38 @@ async def main():
     auth = await client.authorize()
     print(f"Authorized as {auth.get('loginid')} (is_virtual={auth.get('is_virtual')})\n")
 
+    if do_extend:
+        target = config.BACKTEST_HISTORY_CANDLES
+        if target is None:
+            print("--extend requires config.BACKTEST_HISTORY_CANDLES to be set to a target count. Aborting.")
+            await client.close()
+            return
+        print(f"===== EXTEND MODE: target {target} candles per config =====\n")
+        try:
+            for label, chart_timeframe, tf_cal_override in config.BACKTEST_CONFIGS:
+                await extend_config_candles(client, label, chart_timeframe, tf_cal_override, target)
+        except (KeyboardInterrupt, BacktestConnectionError) as e:
+            print(f"\n\nExtend step interrupted: {e}\n"
+                  "Any config that finished extending has already been merged and reconciled on disk. "
+                  "Just re-run `python backtest.py --extend` to continue with any remaining configs.")
+            await client.close()
+            return
+        print("===== EXTEND MODE complete -- proceeding to normal Pass 2 processing =====\n")
+
     all_results = {}
     try:
         for label, chart_timeframe, tf_cal_override in config.BACKTEST_CONFIGS:
             print(f"\n===== Config: {label} =====")
             t0 = time.time()
-            trades, durations_min = await run_config_backtest(client, label, chart_timeframe, tf_cal_override)
+            trades, durations_min, processed_count = await run_config_backtest(client, label, chart_timeframe, tf_cal_override)
             all_results[label] = (trades, durations_min)
             print(f"[{label}] Done: {len(trades)} scorable trade(s) in {time.time()-t0:.1f}s.")
+            # Per-config completion email -- fires once, right when THIS
+            # config's own loop finishes (not just the single combined
+            # email at the very end of all 3 configs).
+            state = ckpt.load_checkpoint(label)
+            total_bars = len(state.get("flagged_bar_epochs", [])) if state else 0
+            send_email(label, processed_count, total_bars, len(trades), event="done")
     except KeyboardInterrupt:
         print("\n\nInterrupted -- progress up to the last checkpoint (every "
               f"{CHECKPOINT_EVERY} bars) has been saved. Just re-run "
@@ -489,6 +706,30 @@ async def main():
             "Attached are the backtest checkpoint and result files:\n\n" + attachment_list,
             attachment_paths,
         )
+
+    print("\n\n===== REPAINT / TRAJECTORY ANALYSIS =====")
+    repaint_result = repaint_analysis.generate_report()
+    print(repaint_result["report_text"])
+    if repaint_result["has_data"]:
+        repaint_result["full_df"].to_csv("repaint_analysis_detail.csv", index=False)
+        repaint_result["repaint_summary"].to_csv("repaint_analysis_summary.csv", index=False)
+        repaint_result["flicker_summary"].to_csv("repaint_analysis_flicker_summary.csv", index=False)
+        repaint_result["pre_summary"].to_csv("repaint_analysis_pre_buildup_summary.csv", index=False)
+        repaint_result["post_summary"].to_csv("repaint_analysis_post_survival_summary.csv", index=False)
+        print("\nSaved: repaint_analysis_detail.csv + 4 summary CSVs")
+
+        send_raw_email("[Backtest] repaint / trajectory analysis", repaint_result["report_text"])
+
+        repaint_csvs = sorted(glob.glob("repaint_analysis_*.csv"))
+        if repaint_csvs:
+            send_email_with_attachments(
+                "[Backtest] repaint analysis attachments",
+                "Attached are the repaint/trajectory analysis CSVs:\n\n"
+                + "\n".join(f"- {p}" for p in repaint_csvs),
+                repaint_csvs,
+            )
+    else:
+        print("No repaint analysis data available (no trades with cluster trajectories yet).")
 
     print("\n\n===== COMBO RESULTS (mutually exclusive, sums to total trades) =====")
     print(combo_text)

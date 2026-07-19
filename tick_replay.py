@@ -24,6 +24,7 @@ rather than silently presenting it as exact.
 
 import pandas as pd
 import numpy as np
+import asyncio
 
 from pipeline import run_pipeline
 
@@ -126,3 +127,169 @@ def find_settlement_price(ticks_after_entry: list, entry_epoch: int, duration_se
         if t["epoch"] >= target_epoch:
             return t["price"], t["epoch"]
     return None, None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CLUSTER TRAJECTORY TRACKING
+#   Groups consecutive same-direction flagged bars into one cluster, pulls
+#   exactly one pre-window bar before it and one post-window bar after it,
+#   and tracks the same-side signal count CONTINUOUSLY across the whole
+#   span -- not just the first-qualifying-tick snapshot find_entry_tick
+#   uses for scoring. This is purely for repaint/stability ANALYSIS
+#   (consumed by repaint_analysis.py); it does not change entry timing or
+#   win/loss scoring, which still comes from find_entry_tick +
+#   find_settlement_price as before.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def cluster_flagged_bars(epoch_side_pairs: list, granularity: int):
+    """
+    epoch_side_pairs: list of (epoch, side) tuples for flagged bars,
+    side is 'buy' or 'sell'.
+
+    Groups epochs into clusters of CONSECUTIVE bars (epoch2 == epoch1 +
+    granularity) that also share the SAME side -- a direction change
+    always breaks a cluster, since there's no single side left to track
+    continuously across it. An isolated flagged bar with no matching
+    neighbor becomes its own single-bar cluster.
+
+    Returns a list of dicts: {"epochs": [...], "side": "buy"/"sell"},
+    sorted oldest -> newest, each internally sorted oldest -> newest.
+    """
+    pairs = sorted(epoch_side_pairs, key=lambda p: p[0])
+    clusters = []
+    current = None
+    for epoch, side in pairs:
+        if current is not None and epoch == current["epochs"][-1] + granularity and side == current["side"]:
+            current["epochs"].append(epoch)
+        else:
+            if current is not None:
+                clusters.append(current)
+            current = {"epochs": [epoch], "side": side}
+    if current is not None:
+        clusters.append(current)
+    return clusters
+
+
+async def compute_cluster_trajectory(full_df: pd.DataFrame, cluster_first_bar_index: int, num_cluster_bars: int,
+                                ticks: list, side: str, granularity: int, pipeline_kwargs: dict,
+                                warmup_bars: int = WARMUP_BARS):
+    """
+    Walks `ticks` (list of (epoch, price) tuples, oldest first, covering
+    at least [pre_bar_open, post_bar_close)) continuously across the
+    pre-window bar, every bar in the cluster, and the post-window bar --
+    finalizing each forming bar into fixed history as its close boundary
+    is crossed, and re-running the pipeline after every single tick to
+    record `side`'s signal count at that instant.
+
+    cluster_first_bar_index: positional index (in full_df) of the
+    cluster's FIRST flagged bar (i.e. the pre-window bar is index-1).
+
+    Returns a dict:
+        {
+          "epochs": [...],           # every tick epoch processed
+          "counts": [...],           # side's signal count at each tick
+          "bar_boundaries": {epoch: "pre"|"cluster"|"post", ...},
+          "qualifying": [...],       # bool per tick, count >= any category present
+        }
+    or None if there isn't enough warmup context / ticks to proceed.
+    """
+    pre_bar_index = cluster_first_bar_index - 1
+    post_bar_index = cluster_first_bar_index + num_cluster_bars  # bar AFTER the cluster's last bar
+
+    if pre_bar_index < 0 or post_bar_index >= len(full_df):
+        return ("edge_of_history", f"cluster at edge of candle history "
+                f"(pre_idx={pre_bar_index}, post_idx={post_bar_index}, df_len={len(full_df)})")
+
+    warmup = build_warmup_history(full_df, pre_bar_index, warmup_bars)
+    if len(warmup) < 40:
+        return ("warmup_too_short", "cluster too close to start of candle cache")
+
+    pre_bar_open = int(full_df.iloc[pre_bar_index]["epoch"]) if "epoch" in full_df.columns else None
+    # bar boundaries: pre-bar, then each cluster bar, then post-bar
+    bar_opens = [cluster_first_bar_index - 1 + i for i in range(num_cluster_bars + 2)]
+    # bar_opens are POSITIONAL indices into full_df for [pre, c1, c2, ..., cN, post]
+
+    completed_rows = []  # rows finalized as we cross bar boundaries
+    trajectory_epochs, trajectory_counts, trajectory_qualifying = [], [], []
+    boundary_label = {}
+
+    # Yield to event loop every N ticks so the websocket keepalive
+    # (ping/pong) can run. Without this, a long sync compute loop
+    # starves the event loop and the connection drops (WinError 64).
+    TICK_YIELD_EVERY = 50
+    tick_counter = 0
+
+    labels = ["pre"] + ["cluster"] * num_cluster_bars + ["post"]
+    bar_idx_ptr = 0  # which of bar_opens we're currently forming
+    current_bar_open_epoch = None
+    current_open_price = None
+    running_high = running_low = None
+
+    for epoch, price in ticks:
+        # advance bar_idx_ptr past any bar whose window this tick has moved beyond
+        while bar_idx_ptr < len(bar_opens) - 1:
+            this_bar_close_epoch = None
+            # bar close epoch = bar open epoch + granularity; determine from full_df position
+            pos = bar_opens[bar_idx_ptr]
+            bar_open_epoch = int(full_df.iloc[pos]["epoch"])
+            this_bar_close_epoch = bar_open_epoch + granularity
+            if epoch < this_bar_close_epoch:
+                break
+            # finalize the current forming bar (if one was started) and move on
+            if current_open_price is not None:
+                completed_rows.append({
+                    "open": current_open_price, "high": running_high,
+                    "low": running_low, "close": running_close_val, "volume": 1.0,
+                })
+            bar_idx_ptr += 1
+            current_bar_open_epoch = None
+            current_open_price = None
+
+        if bar_idx_ptr >= len(bar_opens):
+            break  # ran past the post-bar's own window, nothing more to track
+
+        if current_open_price is None:
+            current_bar_open_epoch = int(full_df.iloc[bar_opens[bar_idx_ptr]]["epoch"])
+            current_open_price = price
+            running_high = price
+            running_low = price
+        running_high = max(running_high, price)
+        running_low = min(running_low, price)
+        running_close_val = price
+
+        partial_row = pd.DataFrame([{
+            "open": current_open_price, "high": running_high,
+            "low": running_low, "close": price, "volume": 1.0,
+        }])
+        if completed_rows:
+            working_df = pd.concat([warmup, pd.DataFrame(completed_rows), partial_row], ignore_index=True)
+        else:
+            working_df = pd.concat([warmup, partial_row], ignore_index=True)
+
+        try:
+            out = run_pipeline(working_df, **pipeline_kwargs)
+        except Exception:
+            continue
+
+        last = out.iloc[-1]
+        count = last["buy_count"] if side == "buy" else last["sell_count"]
+        categories = last["buy_categories"] if side == "buy" else last["sell_categories"]
+
+        trajectory_epochs.append(epoch)
+        trajectory_counts.append(int(count))
+        trajectory_qualifying.append(bool(categories))
+        boundary_label[epoch] = labels[bar_idx_ptr]
+
+        tick_counter += 1
+        if tick_counter % TICK_YIELD_EVERY == 0:
+            await asyncio.sleep(0)
+
+    if not trajectory_epochs:
+        return None
+
+    return {
+        "epochs": trajectory_epochs,
+        "counts": trajectory_counts,
+        "qualifying": trajectory_qualifying,
+        "bar_label": boundary_label,
+    }

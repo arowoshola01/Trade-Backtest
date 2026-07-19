@@ -12,7 +12,8 @@ API_TOKEN = "mA3jGstqSBLZ357"  # demo account token — Read + Trade scope only
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 # ── Market ──
-SYMBOL = "R_100"          # Volatility 100 Index (standard, 2s ticks)
+SYMBOL = "R_100"          # Volatility 100 Index (standard, 2s ticks) (Add # before SYMBOL to test Forex instead of Volatility 100 Index)
+# SYMBOL = "frxEURUSD"      # EUR/USD Forex pair  (Remove # before SYMBOL to test Forex instead of Volatility 100 Index)
 
 # ── Chart timeframe / HMM calibration ──────────────────────────────────────
 # CHART_TIMEFRAME: "5m" or "15m" -- controls candle granularity pulled from
@@ -64,12 +65,13 @@ CONTRACT_DURATION_UNIT = "m"
 CANDLE_HISTORY_COUNT = 1000   # how many bars to pull for indicator warm-up
 
 # ── Backtest settings ───────────────────────────────────────────────────────
-BACKTEST_HISTORY_WEEKS = 3/7   # 3 days, for a quick sanity-check run
+BACKTEST_HISTORY_WEEKS = 4
 
 # Set to a number (e.g. 1000) to pull an exact candle count instead of
 # computing it from BACKTEST_HISTORY_WEEKS. Leave as None to use the
-# weeks-based calculation. Useful for quick sanity-check runs.
-BACKTEST_HISTORY_CANDLES = 1000
+# weeks-based calculation. Useful for quick sanity-check runs, and also
+# used as the target count for `python backtest.py --extend`.
+BACKTEST_HISTORY_CANDLES = 150
 
 # Expiration durations to test, in minutes, per chart timeframe.
 BACKTEST_DURATIONS_MIN = {

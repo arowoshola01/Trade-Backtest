@@ -54,7 +54,8 @@ def save_candles_cache(label: str, df: pd.DataFrame):
 
 def load_checkpoint(label: str):
     """
-    Returns a dict: {flagged_bar_epochs, processed_bar_epochs, trades}
+    Returns a dict: {flagged_bar_epochs, processed_bar_epochs, trades,
+    skipped_bar_epochs, dropped_bar_epochs, cluster_trajectories, skipped_cluster_ids}
     or None if no checkpoint exists yet. Bar identity is the candle's
     OPEN EPOCH (a fixed point in time), not a positional DataFrame index --
     positions shift if the underlying candle pull is ever refreshed or
@@ -68,16 +69,32 @@ def load_checkpoint(label: str):
         state = json.load(f)
     for trade in state.get("trades", []):
         trade["outcomes"] = {int(k): v for k, v in trade["outcomes"].items()}
+    # Ensure skipped_cluster_ids exists for backward compatibility
+    if "skipped_cluster_ids" not in state:
+        state["skipped_cluster_ids"] = []
     return state
 
 
 def save_checkpoint(label: str, flagged_bar_epochs: list, processed_bar_epochs: list, trades: list,
-                    skipped_bar_epochs: list | None = None, dropped_bar_epochs: list | None = None):
+                    skipped_bar_epochs: list | None = None, dropped_bar_epochs: list | None = None,
+                    cluster_trajectories: dict | None = None, skipped_cluster_ids: list | None = None):
     """
     Atomic save. flagged_bar_epochs / processed_bar_epochs are lists of
     candle OPEN EPOCHS (not positional indices) -- see load_checkpoint
     docstring for why. Trade 'outcomes' dicts get their int keys
     stringified for JSON (JSON object keys must be strings).
+
+    cluster_trajectories: {cluster_id (str): {"epochs": [...], "counts":
+    [...], "qualifying": [...], "bar_label": {epoch(str): label}}} --
+    raw pre/cluster/post tick-level signal trajectories, captured once
+    per fresh cluster by capture_cluster_trajectories() in backtest.py.
+    Referenced by individual trades via their "cluster_id" field.
+    Purely for offline analysis (repaint_analysis.py); never used to
+    change entry timing or win/loss scoring.
+
+    skipped_cluster_ids: list of cluster IDs (strings) that were at the
+    edge of available history and couldn't be captured. These will be
+    retried on resume if the dataframe has grown.
     """
     _ensure_dir()
     serializable_trades = []
@@ -87,12 +104,32 @@ def save_checkpoint(label: str, flagged_bar_epochs: list, processed_bar_epochs: 
         t["bar_epoch"] = int(trade["bar_epoch"])
         serializable_trades.append(t)
 
+    serializable_trajectories = {}
+    for cid, traj in (cluster_trajectories or {}).items():
+        entry = {
+            "epochs": [int(e) for e in traj["epochs"]],
+            "counts": [int(c) for c in traj["counts"]],
+            "qualifying": [bool(q) for q in traj["qualifying"]],
+            "bar_label": {str(e): lbl for e, lbl in traj["bar_label"].items()},
+        }
+        # Carry forward cached ticks + window bounds so Pass 2 can reuse
+        # them on resume instead of re-pulling from Deriv.
+        if "ticks" in traj:
+            entry["ticks"] = traj["ticks"]
+        if "window_start" in traj:
+            entry["window_start"] = traj["window_start"]
+        if "window_end" in traj:
+            entry["window_end"] = traj["window_end"]
+        serializable_trajectories[str(cid)] = entry
+
     state = {
         "flagged_bar_epochs": [int(e) for e in flagged_bar_epochs],
         "processed_bar_epochs": [int(e) for e in processed_bar_epochs],
         "trades": serializable_trades,
         "skipped_bar_epochs": [int(e) for e in (skipped_bar_epochs or [])],
         "dropped_bar_epochs": [int(e) for e in (dropped_bar_epochs or [])],
+        "cluster_trajectories": serializable_trajectories,
+        "skipped_cluster_ids": [str(cid) for cid in (skipped_cluster_ids or [])],
     }
 
     path = checkpoint_path(label)
