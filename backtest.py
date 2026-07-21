@@ -29,7 +29,7 @@ import websockets.exceptions
 import config
 from deriv_client import DerivClient, DerivAPIError
 from pipeline import run_pipeline
-from tick_replay import find_entry_tick, find_settlement_price, iter_bar_ticks
+from tick_replay import find_entry_tick, find_settlement_price, iter_bar_ticks, cluster_flagged_bars
 from strategy import StrategyConfig
 import checkpoint as ckpt
 from network_retry import (call_with_reconnect, BacktestConnectionError, TICK_PACE_DELAY,
@@ -181,8 +181,21 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
         if retryable_epochs:
             print(f"[{label}] Requeueing {len(retryable_epochs)} previously incomplete bar(s) for retry.")
         prior_clusters = len(state.get("cluster_trajectories", {}))
+        # Compute the TOTAL cluster count (captured + remaining) so the
+        # "From checkpoint" line reflects the full cluster set, not just
+        # the trajectories captured so far. cluster_flagged_bars groups
+        # flagged bars into same-direction consecutive-bar clusters --
+        # same grouping used inside capture_cluster_trajectories().
+        epoch_side_pairs = []
+        for e in flagged_bar_epochs:
+            pos = epoch_to_pos.get(e)
+            if pos is None:
+                continue
+            row = out.iloc[pos]
+            epoch_side_pairs.append((e, "buy" if row["decision"] == "CALL" else "sell"))
+        total_clusters = len(cluster_flagged_bars(epoch_side_pairs, granularity))
         print(f"[{label}] From checkpoint: {len(flagged_bar_epochs)} bar(s) flagged, "
-              f"{prior_clusters} cluster captured, {len(processed_epoch_set)}/{len(flagged_bar_epochs)} "
+              f"{total_clusters} cluster captured, {len(processed_epoch_set)}/{len(flagged_bar_epochs)} "
               f"bar(s) already processed, {len(trades)} trade(s) so far.")
     else:
         flagged = out[out["decision"].notna()].copy()
