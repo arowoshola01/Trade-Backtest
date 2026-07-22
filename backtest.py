@@ -131,6 +131,8 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
     # ── candle pull, cached ──
     df = ckpt.load_candles_cache(label)
     if df is not None:
+        print(f"[{label}] {config.BACKTEST_HISTORY_CANDLES} candle pulled.")
+        print(f"[{label}] Loading from cache...")
         print(f"[{label}] Loaded {len(df)} candles from cache.")
     else:
         if config.BACKTEST_HISTORY_CANDLES is not None:
@@ -141,7 +143,7 @@ async def run_config_backtest(client: DerivClient, label: str, chart_timeframe: 
                   f"(tf_cal={tf_cal})...")
         df = await call_with_reconnect(client, label, "candle pull",
                                         pull_candles, client, granularity, config.BACKTEST_HISTORY_WEEKS)
-        print(f"[{label}] Pulled {len(df)} candles.")
+        print(f"[{label}] {len(df)} candle pulled.")
         ckpt.save_candles_cache(label, df)
 
     # epoch <-> positional-index lookup for THIS session's DataFrame.
@@ -635,7 +637,8 @@ async def main():
     client = DerivClient()
     await client.connect()
     auth = await client.authorize()
-    print(f"Authorized as {auth.get('loginid')} (is_virtual={auth.get('is_virtual')})\n")
+    print(f"Authorized as {auth.get('loginid')} (is_virtual={auth.get('is_virtual')})")
+    print(f"Market Symbol: {config.SYMBOL}\n")
 
     if do_extend:
         target = config.BACKTEST_HISTORY_CANDLES
@@ -658,7 +661,7 @@ async def main():
     all_results = {}
     try:
         for label, chart_timeframe, tf_cal_override in config.BACKTEST_CONFIGS:
-            print(f"\n===== Config: {label} =====")
+            print(f"===== Config: {label} =====")
             t0 = time.time()
             trades, durations_min, processed_count = await run_config_backtest(client, label, chart_timeframe, tf_cal_override)
             all_results[label] = (trades, durations_min)
